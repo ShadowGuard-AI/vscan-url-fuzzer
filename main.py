@@ -78,12 +78,14 @@ def join_word(base_url, word):
     path at the host root.
     """
     base = base_url if base_url.endswith("/") else base_url + "/"
+    # A wordlist entry that is itself a full URL survives the slash stripping and replaces the base entirely inside urljoin. One such line in a borrowed wordlist sends a probe to somebody else's server under my user agent.
     return urljoin(base, word.lstrip("/"))
 
 
 def _probe(url, headers, timeout, verify_ssl):
     """Send one request. Returns (url, status) or (url, None) on failure."""
     try:
+        # requests follows redirects for me, so the status I judge is the landing page's, not the probed path's. Against a catch all that redirects everything to a login page, every word in the list lands on the same 200 and I report the whole wordlist as discovered. I never probe a nonsense word first to learn what this target does with paths that cannot exist.
         response = requests.get(url, headers=headers, timeout=timeout, verify=verify_ssl)
         return url, response.status_code
     except requests.exceptions.RequestException as e:
@@ -108,6 +110,7 @@ def fuzz_level(base_url, wordlist, accepted_status_codes, timeout, user_agent, v
     failed = 0
     if threads and threads > 1:
         with ThreadPoolExecutor(max_workers=threads) as pool:
+            # pool.map hands me results back in wordlist order however the requests actually finished, which keeps the output file stable between threaded and serial runs. The log lines inside _probe are not so lucky: with several workers they interleave in whatever order the responses landed.
             results = list(pool.map(lambda u: _probe(u, headers, timeout, verify_ssl), urls))
     else:
         results = [_probe(u, headers, timeout, verify_ssl) for u in urls]
@@ -136,6 +139,7 @@ def fuzz_url(base_url, wordlist, output_file, accepted_status_codes, timeout, us
     succeeded = 0
     failed = 0
     try:
+        # Append is deliberate for long runs, but it means the output file accumulates across runs while my dedupe set only remembers this run. A second run over the same target writes duplicates of everything the first run found, and stale entries from a changed site stay in the file forever.
         with open(output_file, "a") as outfile:  # Open file in append mode
             discovered, ok, bad = fuzz_level(base_url, wordlist, accepted_status_codes, timeout, user_agent, verify_ssl, threads)
             succeeded += ok
@@ -147,6 +151,7 @@ def fuzz_url(base_url, wordlist, output_file, accepted_status_codes, timeout, us
             if recursive:
                 for url in discovered:
                     last_segment = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+                    # A dot is my whole test for file versus directory. A directory named v1.0 is never recursed into, and an extensionless file is fuzzed as if it were a directory, spending a full wordlist pass underneath a path that cannot hold children.
                     if "." in last_segment:
                         continue
                     deeper, ok, bad = fuzz_level(url, wordlist, accepted_status_codes, timeout, user_agent, verify_ssl, threads)
