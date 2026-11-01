@@ -1,9 +1,9 @@
 import argparse
 import requests
 import logging
-from bs4 import BeautifulSoup
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, urljoin
 
 # Configure logging
@@ -15,12 +15,12 @@ def setup_argparse():
     """
     parser = argparse.ArgumentParser(description="Fuzzes URL paths with common directory and file names to discover hidden resources.")
     parser.add_argument("url", help="The base URL to fuzz.")
-    parser.add_argument("-w", "--wordlist", help="Path to the wordlist file (default: common.txt).", default="common.txt")
+    parser.add_argument("-w", "--wordlist", help="Path to the wordlist file (default: common.txt, shipped with this tool).", default="common.txt")
     parser.add_argument("-o", "--output", help="Path to the output file to save discovered URLs.", default="discovered_urls.txt")
-    parser.add_argument("-t", "--threads", type=int, help="Number of threads (not implemented).", default=1) #Placeholder
+    parser.add_argument("-t", "--threads", type=int, help="Number of worker threads used to send requests (default: 1).", default=1)
     parser.add_argument("-s", "--status-codes", help="Comma-separated list of accepted status codes (default: 200,301,302,403).", default="200,301,302,403")
     parser.add_argument("--timeout", type=int, help="Request timeout in seconds (default: 5).", default=5)
-    parser.add_argument("--recursive", action="store_true", help="Recursively fuzz discovered directories (not implemented).") #Placeholder
+    parser.add_argument("--recursive", action="store_true", help="Fuzz one level under each discovered directory as well.")
     parser.add_argument("--user-agent", help="Custom User-Agent header (default: vscan-url-fuzzer).", default="vscan-url-fuzzer")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL certificate verification (not recommended).")
 
@@ -35,17 +35,26 @@ def is_valid_url(url):
     try:
         result = urlparse(url)
         return all([result.scheme, result.netloc])
-    except:
+    except Exception:
         return False
 
 def read_wordlist(wordlist_path):
     """
     Reads the wordlist from the given file path.
     Handles file not found and empty wordlist errors.
+
+    When the default common.txt is not in the working directory, the
+    copy shipped next to this script is used, so a default run works
+    from any directory.
     """
+    path = wordlist_path
+    if not os.path.exists(path):
+        bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "common.txt")
+        if os.path.abspath(bundled) != os.path.abspath(path) and os.path.exists(bundled):
+            path = bundled
     try:
-        with open(wordlist_path, "r") as f:
-            words = [line.strip() for line in f]
+        with open(path, "r") as f:
+            words = [line.strip() for line in f if line.strip()]
         if not words:
             raise ValueError("Wordlist file is empty.")
         return words
@@ -60,37 +69,100 @@ def read_wordlist(wordlist_path):
         sys.exit(1)
 
 
-def fuzz_url(base_url, wordlist, output_file, accepted_status_codes, timeout, user_agent, verify_ssl):
+def join_word(base_url, word):
+    """
+    Join one wordlist entry onto the base URL, keeping the base path.
+
+    The base is treated as a directory: a base of http://host/app and
+    the word sentinelok produce http://host/app/sentinelok, never a
+    path at the host root.
+    """
+    base = base_url if base_url.endswith("/") else base_url + "/"
+    return urljoin(base, word.lstrip("/"))
+
+
+def _probe(url, headers, timeout, verify_ssl):
+    """Send one request. Returns (url, status) or (url, None) on failure."""
+    try:
+        response = requests.get(url, headers=headers, timeout=timeout, verify=verify_ssl)
+        return url, response.status_code
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request failed for {url}: {e}")
+        return url, None
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while processing {url}: {e}")
+        return url, None
+
+
+def fuzz_level(base_url, wordlist, accepted_status_codes, timeout, user_agent, verify_ssl, threads):
+    """
+    Fuzz one level under base_url.
+
+    Returns (discovered_urls, succeeded, failed), where succeeded is
+    the count of requests that received any response at all.
+    """
+    headers = {'User-Agent': user_agent}
+    urls = [join_word(base_url, word) for word in wordlist]
+    discovered = []
+    succeeded = 0
+    failed = 0
+    if threads and threads > 1:
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            results = list(pool.map(lambda u: _probe(u, headers, timeout, verify_ssl), urls))
+    else:
+        results = [_probe(u, headers, timeout, verify_ssl) for u in urls]
+    for url, status in results:
+        if status is None:
+            failed += 1
+            continue
+        succeeded += 1
+        if status in accepted_status_codes:
+            logging.info(f"Found: {url} - Status Code: {status}")
+            discovered.append(url)
+    return discovered, succeeded, failed
+
+
+def fuzz_url(base_url, wordlist, output_file, accepted_status_codes, timeout, user_agent, verify_ssl, threads=1, recursive=False):
     """
     Fuzzes the given URL with the provided wordlist and saves discovered URLs to the output file.
+
+    With recursive set, each discovered entry whose last path segment
+    has no file extension is treated as a directory and fuzzed one
+    level deeper with the same wordlist. Recursion stops there.
+
+    Returns (succeeded, failed) request counts across all levels.
     """
     discovered_urls = set()
-    headers = {'User-Agent': user_agent}
-
+    succeeded = 0
+    failed = 0
     try:
         with open(output_file, "a") as outfile:  # Open file in append mode
-
-            for word in wordlist:
-                url = urljoin(base_url, word)
-                try:
-                    response = requests.get(url, headers=headers, timeout=timeout, verify=verify_ssl)
-                    if response.status_code in accepted_status_codes:
-                        logging.info(f"Found: {url} - Status Code: {response.status_code}")
-                        if url not in discovered_urls:
-                            outfile.write(url + "\n")
-                            discovered_urls.add(url)
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Request failed for {url}: {e}")
-                except Exception as e:
-                    logging.error(f"An unexpected error occurred while processing {url}: {e}")
-
-
+            discovered, ok, bad = fuzz_level(base_url, wordlist, accepted_status_codes, timeout, user_agent, verify_ssl, threads)
+            succeeded += ok
+            failed += bad
+            for url in discovered:
+                if url not in discovered_urls:
+                    outfile.write(url + "\n")
+                    discovered_urls.add(url)
+            if recursive:
+                for url in discovered:
+                    last_segment = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+                    if "." in last_segment:
+                        continue
+                    deeper, ok, bad = fuzz_level(url, wordlist, accepted_status_codes, timeout, user_agent, verify_ssl, threads)
+                    succeeded += ok
+                    failed += bad
+                    for found in deeper:
+                        if found not in discovered_urls:
+                            outfile.write(found + "\n")
+                            discovered_urls.add(found)
     except IOError as e:
         logging.error(f"Error writing to output file: {e}")
         sys.exit(1)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
         sys.exit(1)
+    return succeeded, failed
 
 
 
@@ -105,6 +177,10 @@ def main():
         logging.error("Invalid URL provided.")
         sys.exit(1)
 
+    if args.threads < 1:
+        logging.error("Threads must be at least 1.")
+        sys.exit(1)
+
     try:
         accepted_status_codes = [int(code) for code in args.status_codes.split(",")]
     except ValueError:
@@ -116,7 +192,11 @@ def main():
 
     wordlist = read_wordlist(args.wordlist)
 
-    fuzz_url(args.url, wordlist, args.output, accepted_status_codes, args.timeout, args.user_agent, verify_ssl)
+    succeeded, failed = fuzz_url(args.url, wordlist, args.output, accepted_status_codes, args.timeout, args.user_agent, verify_ssl, threads=args.threads, recursive=args.recursive)
+
+    if succeeded == 0:
+        logging.error(f"Fuzzing failed: no request succeeded ({failed} failed). The target was not reached, so no completion is reported.")
+        sys.exit(1)
 
     logging.info("Fuzzing completed.")
 
